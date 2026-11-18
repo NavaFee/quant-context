@@ -6,6 +6,7 @@ from datetime import date
 from decimal import Decimal, getcontext
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
@@ -189,7 +190,7 @@ def check_product(text):
                         if kind is not None:
                             verify_example(report)
                             require(bool(report["trades"]) == kind, "trades", "does not match the example label")
-                            examples.append((report, start, line_no))
+                            examples.append((report, start, line_no, count))
                         example_kind = None
                     except json.JSONDecodeError as exc:
                         raise ValueError(f"{location}: line {start + exc.lineno}, column {exc.colno}: {exc.msg}") from exc
@@ -205,9 +206,10 @@ def check_product(text):
                 example_kind = line.startswith("有成交：")
             opening = re.match(r"^ {0,3}(`{3,}|~{3,})([^`]*?)\s*$", line)
             if opening:
-                fence = (opening[1], opening[2].strip(), line_no, example_kind)
+                info = opening[2].split()
+                fence = (opening[1], info[0] if info else "", line_no, example_kind)
     require(fence is None, f"product.md:{fence[2] if fence else 1}", "unclosed code fence")
-    require(sorted(bool(report["trades"]) for report, _, _ in examples) == [False, True],
+    require(sorted(bool(report["trades"]) for report, _, _, _ in examples) == [False, True],
             "product.md 合法 JSON 示例", "expected one traded and one no-trades complete example")
     return count, examples
 
@@ -243,10 +245,10 @@ def verify(repo):
 def self_test(repo):
     product = (repo / "product.md").read_text(encoding="utf-8")
     _, examples = check_product(product)
-    traded = next(report for report, _, _ in examples if report["trades"])
+    traded, traded_start, traded_end, traded_number = next(item for item in examples if item[0]["trades"])
     lines = product.splitlines(keepends=True)
     spans = [(len("".join(lines[:start - 1])), len("".join(lines[:end - 1])), len("".join(lines[:end])))
-             for _, start, end in examples]
+             for _, start, end, _ in examples]
     cases = 0
 
     def probe(label, function, *args, fails=True):
@@ -302,6 +304,9 @@ def self_test(repo):
         ("unclosed fence", product[:spans[-1][1]], True),
         ("valid extra JSON", product + '\n```json\n{"extra": null}\n```\n', False),
         ("invalid extra JSON", product + '\n```json\n{"extra": NaN}\n```\n', True),
+        ("JSON with info", product + '\n```json title="extra"\n{"extra": 1}\n```\n', False),
+        ("invalid JSON with info", product + '\n```json title="extra"\n{"extra": NaN}\n```\n', True),
+        ("tab-separated info", product + '\n```json\ttitle="extra"\n{"extra": NaN}\n```\n', True),
         ("earlier JSON", '```json\n{"extra": 1}\n```\n' + product, False),
         ("extra JSON in example section", product.replace("无成交：", '```json\n{"extra": 1}\n```\n\n无成交：'), False),
         ("syntax", product.replace('"trade_count": 1', '"trade_count": }', 1), True),
@@ -320,15 +325,25 @@ def self_test(repo):
         shutil.copy2(__file__, root / "scripts/verify_context.py")
         command = [sys.executable, "-O", "scripts/verify_context.py"]
         for broken in (True, False):
-            body = product.replace('"trade_count": 1', '"trade_count": true', 1) if broken else product
+            sample = "".join(lines[traded_start:traded_end - 1])
+            changed = sample.replace('"trade_count": 1', '"trade_count": true', 1)
+            body = "".join(lines[:traded_start]) + changed + "".join(lines[traded_end - 1:]) if broken else product
             require(not broken or body != product, "AC5", "mutation target missing")
             (root / "product.md").write_text(body, encoding="utf-8")
             result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
             require(result.returncode == (1 if broken else 0), "CLI", result.stdout + result.stderr)
             if broken:
-                require("product.md:" in result.stderr and "JSON block #1" in result.stderr and "metrics.trade_count" in result.stderr,
+                require(f"product.md:{traded_start} JSON block #{traded_number}: metrics.trade_count:" in result.stderr,
                         "CLI", "missing file/block/field diagnostic")
             print(f"AC5 {'broken' if broken else 'restored'}: exit {result.returncode}\n{(result.stderr or result.stdout).strip()}")
+            cases += 1
+        # Only the outer invocation launches this nested full CLI self-test.
+        if not os.environ.get("VERIFY_CONTEXT_NESTED"):
+            (root / "product.md").write_text('```json title="extra"\n{"extra": 1}\n```\n' + product, encoding="utf-8")
+            result = subprocess.run(command + ["--self-test"], cwd=root, capture_output=True, text=True,
+                                    timeout=30, env=dict(os.environ, VERIFY_CONTEXT_NESTED="1"))
+            require(result.returncode == 0, "CLI earlier JSON self-test", result.stdout + result.stderr)
+            print("PASS: real CLI --self-test with an earlier JSON block carrying extra fence info")
             cases += 1
     print(f"PASS: {cases} self-tests, including the original 19 rejection probes and optimized CLI failure/recovery")
 
